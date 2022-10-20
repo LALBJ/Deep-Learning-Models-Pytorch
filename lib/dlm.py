@@ -275,6 +275,29 @@ class TimeMachine(dlm.DataModule):
             self.num_train, self.num_train + self.num_val)
         return self.get_tensorloader([self.X, self.Y], train, idx)
     
+class RNNScratch(dlm.Module):
+    def __init__(self, num_inputs, num_hiddens, sigma=0.01):
+        super().__init__()
+        self.save_hyperparameters()
+        self.W_xh = nn.Parameter(
+            dlm.randn(num_inputs, num_hiddens) * sigma
+        )
+        self.W_hh = nn.Parameter(
+            dlm.randn(num_hiddens, num_hiddens) * sigma
+        )
+        self.b_h = nn.Parameter(dlm.zeros(num_hiddens))
+    
+    def forward(self, inputs, state=None):
+        if state is not None:
+            state, = state
+        outputs = []
+        for X in inputs:
+            state = dlm.tanh(dlm.matmul(X, self.W_xh) + (
+                dlm.matmul(state, self.W_hh) if state is not None else 0
+            ) + self.b_h)
+            outputs.append(state)
+        return outputs, state
+
 class RNNLMScratch(dlm.Classifier):
     def __init__(self, rnn, vocab_size, lr=0.01):
         super().__init__()

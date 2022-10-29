@@ -1,15 +1,12 @@
 DATA_HUB = dict()
 DATA_URL = 'http://d2l-data.s3-accelerate.amazonaws.com/'
-from itertools import count
-from lib2to3.pgen2 import token
-from random import shuffle
-from statistics import mode
 import torch
 from torch import nn
 from torch.nn import functional as F
 
 import sys
 import hashlib
+import math
 import os
 import requests
 import zipfile
@@ -391,7 +388,134 @@ class EncoderDecoder(dlm.Classifier):
             if save_attention_weights:
                 attention_weights.append(self.decoder.attention_weights)
         return dlm.concat(outputs[1:], 1), attention_weights
-    
+
+def init_seq2seq(module):
+    if type(module) == nn.Linear:
+         nn.init.xavier_uniform_(module.weight)
+    if type(module) == nn.GRU:
+        for param in module._flat_weights_names:
+            if "weight" in param:
+                nn.init.xavier_uniform_(module._parameters[param])
+
+class Seq2SeqEncoder(dlm.Encoder):
+    def __init__(self, vocab_size, embed_size, num_hiddens, num_layers,
+                 dropout=0):
+        super().__init__()
+        self.embedding = nn.Embedding(vocab_size, embed_size)
+        self.rnn = dlm.GRU(embed_size, num_hiddens, num_layers, dropout)
+        self.apply(init_seq2seq)
+
+    def forward(self, X, *args):
+        embs = self.embedding(dlm.astype(dlm.transpose(X), dlm.int64))
+        output, state = self.rnn(embs)
+        
+        return output, state
+
+class Seq2Seq(dlm.EncoderDecoder):
+    """Defined in :numref:`sec_seq2seq_decoder`"""
+    def __init__(self, encoder, decoder, tgt_pad, lr):
+        super().__init__(encoder, decoder)
+        self.save_hyperparameters()
+
+    def validation_step(self, batch):
+        Y_hat = self(*batch[:-1])
+        self.plot('loss', self.loss(Y_hat, batch[-1]), train=False)
+
+    def configure_optimizers(self):
+        return torch.optim.Adam(self.parameters(), lr=self.lr)
+
+def bleu(pred_seq, label_seq, k):
+    pred_tokens, label_tokens = pred_seq.split(' '), label_seq.split(' ')
+    len_pred, len_label = len(pred_tokens), len(label_tokens)
+    score = math.exp(min(0, 1 - len_label / len_pred))
+    for n in range(1, min(k, len_pred) + 1):
+        num_matches, label_subs = 0, collections.defaultdict(int)
+        for i in range(len_label - n + 1):
+            label_subs[' '.join(label_tokens[i: i + n])] += 1
+        for i in range(len_pred - n + 1):
+            if label_subs[' '.join(pred_tokens[i: i + n])] > 0:
+                num_matches += 1
+                label_subs[' '.join(pred_tokens[i: i + n])] -= 1
+        score *= math.pow(num_matches / (len_pred - n + 1), math.pow(0.5, n))
+    return score
+
+
+def masked_softmax(X, valid_lens):
+    # X: 3D tensor, valid_lens: 1D or 2D tensor
+    def _sequence_mask(X, valid_len, value=0):
+        maxlen = X.size(1)
+        mask = torch.arange((maxlen), dtype=torch.float32,
+                            device=X.device)[None, :] < valid_len[:, None]
+        X[~mask] = value
+        return X
+
+    if valid_lens is None:
+        return nn.functional.softmax(X, dim=-1)
+    else:
+        shape = X.shape
+        if valid_lens.dim() == 1:
+            valid_lens = torch.repeat_interleave(valid_lens, shape[1])
+        else:
+            valid_lens = valid_lens.reshape(-1)
+        # On the last axis, replace masked elements with a very large negative
+        # value, whose exponentiation outputs 0
+        X = _sequence_mask(X.reshape(-1, shape[-1]), valid_lens, value=-1e6)
+        return nn.functional.softmax(X.reshape(shape), dim=-1)
+
+class AdditiveAttention(nn.Module):
+    def __init__(self, num_hiddens, dropout, **kwargs):
+        super(AdditiveAttention, self).__init__(**kwargs)
+        self.W_k = nn.LazyLinear(num_hiddens, bias=False)
+        self.W_q = nn.LazyLinear(num_hiddens, bias=False)
+        self.w_v = nn.LazyLinear(1, bias=False)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, queries, keys, values, valid_lens):
+        queries, keys = self.W_q(queries), self.W_k(keys)
+        # After dimension expansion, shape of queries: (batch_size, no. of
+        # queries, 1, num_hiddens) and shape of keys: (batch_size, 1, no. of
+        # key-value pairs, num_hiddens). Sum them up with broadcasting
+        features = queries.unsqueeze(2) + keys.unsqueeze(1)
+        features = torch.tanh(features)
+        # There is only one output of self.w_v, so we remove the last
+        # one-dimensional entry from the shape. Shape of scores: (batch_size,
+        # no. of queries, no. of key-value pairs)
+        scores = self.w_v(features).squeeze(-1)
+        self.attention_weights = masked_softmax(scores, valid_lens)
+        # Shape of values: (batch_size, no. of key-value pairs, value
+        # dimension)
+        return torch.bmm(self.dropout(self.attention_weights), values)
+
+class DotProductAttention(nn.Module):
+    def __init__(self, dropout, num_heads=None):
+        super().__init__()
+        self.dropout = nn.Dropout(dropout)
+        self.num_heads = num_heads  # To be covered later
+
+    # Shape of queries: (batch_size, no. of queries, d)
+    # Shape of keys: (batch_size, no. of key-value pairs, d)
+    # Shape of values: (batch_size, no. of key-value pairs, value dimension)
+    # Shape of valid_lens: (batch_size,) or (batch_size, no. of queries)
+    def forward(self, queries, keys, values, valid_lens=None,
+                window_mask=None):
+        d = queries.shape[-1]
+        # Swap the last two dimensions of keys with keys.transpose(1, 2)
+        scores = torch.bmm(queries, keys.transpose(1, 2)) / math.sqrt(d)
+        if window_mask is not None:  # To be covered later
+            num_windows = window_mask.shape[0]
+            n, num_queries, num_kv_pairs = scores.shape
+            # Shape of window_mask: (num_windows, no. of queries,
+            # no. of key-value pairs)
+            scores = dlm.reshape(
+                scores, (n//(num_windows*self.num_heads), num_windows,
+                         self.num_heads, num_queries, num_kv_pairs
+                        )) + dlm.expand_dims(
+                dlm.expand_dims(window_mask, 1), 0)
+            scores = dlm.reshape(scores, (n, num_queries, num_kv_pairs))
+        self.attention_weights = masked_softmax(scores, valid_lens)
+        return torch.bmm(self.dropout(self.attention_weights), values)
+
+
 class RNN(dlm.Module):
     def __init__(self, num_inputs, num_hiddens):
         super().__init__()
